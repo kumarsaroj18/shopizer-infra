@@ -1,0 +1,13 @@
+# Secrets – never commit
+.env
+
+# Downloaded image tars cache
+.image-cache/
+
+# Rollback history (local state)
+.rollback-history
+
+# Staged artifact files placed here by CD workflow during docker build
+backend/shopizer.jar
+admin/dist/
+react/build/

@@ -1,0 +1,174 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CD Workflow for shopizer-admin (Angular)
+#
+# LOCATION: Reference copy. Authoritative version:
+#   shopizer-admin/.github/workflows/cd.yml
+#
+# ⚠️  Key facts:
+#   • CI workflow name: "CI"  (not "CI Pipeline")
+#   • CI artifact pattern: shopizer-admin-build-<run_number>
+#   • Dockerfile lives in shopizer-infra (not in the admin source repo)
+#   • Version extracted from package.json (fallback: 1.0.0)
+# ─────────────────────────────────────────────────────────────────────────────
+name: CD – Admin UI (shopizer-admin)
+
+on:
+  workflow_run:
+    # ⚠️  Must match `name:` in shopizer-admin/ci.yml exactly: "CI"
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main, master, develop]
+  workflow_dispatch:
+    inputs:
+      ci_run_id:
+        description: 'CI workflow run ID to deploy'
+        required: false
+        type: string
+
+env:
+  IMAGE_NAME: shopizer-admin
+  NODE_VERSION: '18'
+  # Infra repo that owns the Dockerfile + nginx.conf for all services
+  INFRA_REPO: ${{ github.repository_owner }}/shopizer-infra
+
+jobs:
+  guard:
+    name: Check CI status
+    runs-on: ubuntu-latest
+    outputs:
+      should_deploy: ${{ steps.check.outputs.should_deploy }}
+      ci_run_id: ${{ steps.check.outputs.ci_run_id }}
+    steps:
+      - name: Evaluate trigger
+        id: check
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            if [[ "${{ github.event.workflow_run.conclusion }}" != "success" ]]; then
+              echo "should_deploy=false" >> $GITHUB_OUTPUT
+            else
+              echo "should_deploy=true" >> $GITHUB_OUTPUT
+              echo "ci_run_id=${{ github.event.workflow_run.id }}" >> $GITHUB_OUTPUT
+            fi
+          else
+            CI_RUN="${{ github.event.inputs.ci_run_id }}"
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+            echo "ci_run_id=${CI_RUN}" >> $GITHUB_OUTPUT
+          fi
+
+  build-image:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: guard
+    if: needs.guard.outputs.should_deploy == 'true'
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+
+    steps:
+      # ── Checkout (package.json only from admin; Dockerfile from shopizer-infra) ─
+      - name: Checkout shopizer-admin (sparse – package.json)
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            package.json
+          sparse-checkout-cone-mode: false
+
+      # ── Extract version from package.json ─────────────────────────────────────
+      - name: Extract version
+        id: meta
+        run: |
+          # Fallback to '1.0.0' when package.json has no version field
+          RAW_VERSION=$(node -p "require('./package.json').version" 2>/dev/null || echo "")
+          VERSION=${RAW_VERSION:-1.0.0}
+          if [[ "$VERSION" == "undefined" ]]; then VERSION="1.0.0"; fi
+
+          SHORT_SHA=$(echo "${{ github.event.workflow_run.head_sha || github.sha }}" | cut -c1-8)
+          echo "version=${VERSION}"                   >> $GITHUB_OUTPUT
+          echo "image_tag=${VERSION}-${SHORT_SHA}"    >> $GITHUB_OUTPUT
+          echo "short_sha=${SHORT_SHA}"               >> $GITHUB_OUTPUT
+
+      # ── Checkout shopizer-infra for Dockerfile + nginx.conf ──────────────────
+      - name: Checkout shopizer-infra (Dockerfile + nginx.conf)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.INFRA_REPO }}
+          path: shopizer-infra
+          sparse-checkout: |
+            shopizer/deployment/admin
+          sparse-checkout-cone-mode: false
+
+      # ── Resolve CI run ID ─────────────────────────────────────────────────────
+      - name: Resolve CI run ID
+        id: resolve_run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RUN_ID="${{ needs.guard.outputs.ci_run_id }}"
+          if [[ -z "$RUN_ID" ]]; then
+            RUN_ID=$(gh run list \
+              --workflow "CI" \
+              --status success \
+              --limit 1 \
+              --json databaseId \
+              --jq '.[0].databaseId')
+          fi
+          echo "run_id=${RUN_ID}" >> $GITHUB_OUTPUT
+
+      # ── Download dist artifact ────────────────────────────────────────────────
+      # CI (shopizer-admin/ci.yml) uploads: name=shopizer-admin-build-<run_number>
+      #                                       path=shopizer-admin-<sha>.tar.gz
+      - name: Download dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ steps.resolve_run.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          pattern: "shopizer-admin-build-*"
+          merge-multiple: true
+          path: artifacts/
+
+      - name: Stage dist into Dockerfile build context
+        run: |
+          echo "Downloaded files:"
+          find artifacts/ -type f | sort
+
+          TARBALL=$(find artifacts/ -name "*.tar.gz" | head -1)
+          if [[ -z "$TARBALL" ]]; then
+            echo "ERROR: No .tar.gz found in artifacts!"
+            ls -R artifacts/
+            exit 1
+          fi
+
+          mkdir -p shopizer-infra/shopizer/deployment/admin/dist
+          tar -xzf "$TARBALL" -C shopizer-infra/shopizer/deployment/admin/dist/
+          echo "Dist files: $(find shopizer-infra/shopizer/deployment/admin/dist -type f | wc -l) files"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v5
+        with:
+          context: shopizer-infra/shopizer/deployment/admin
+          file:    shopizer-infra/shopizer/deployment/admin/Dockerfile
+          push: false
+          load: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.image_tag }}
+            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+
+      - name: Export image tar
+        run: |
+          mkdir -p image-export
+          docker save \
+            ${{ env.IMAGE_NAME }}:latest \
+            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.image_tag }} \
+            | gzip > image-export/shopizer-admin-${{ steps.meta.outputs.image_tag }}.tar.gz
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-admin-${{ steps.meta.outputs.image_tag }}
+          path: image-export/shopizer-admin-${{ steps.meta.outputs.image_tag }}.tar.gz
+          retention-days: 30
+          compression-level: 0

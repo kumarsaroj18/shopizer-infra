@@ -1,0 +1,51 @@
+# =============================================================================
+# shopizer-infra – root .gitignore
+# =============================================================================
+
+# ── Credentials & secrets ─────────────────────────────────────────────────────
+# NEVER commit actual environment files containing passwords / tokens
+deployment/.env
+deployment/**/.env
+.env
+
+# ── Runtime / deployment state ────────────────────────────────────────────────
+# Docker image tar cache produced by deploy-local.sh
+deployment/.image-cache/
+
+# Rollback history (local state, not meaningful to share)
+deployment/.rollback-history
+
+# Staged artifact directories placed into build context by CD workflows
+deployment/backend/shopizer.jar
+deployment/admin/dist/
+deployment/react/build/
+deployment/frontend/admin-dist/
+deployment/frontend/react-build/
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+
+# ── JetBrains IDEs (IntelliJ / WebStorm / Rider …) ───────────────────────────
+.idea/*
+!.idea/.gitignore          # keep the IDE's own gitignore if present
+*.iws
+*.iml
+*.ipr
+out/
+
+# ── VS Code ───────────────────────────────────────────────────────────────────
+.vscode/
+*.code-workspace
+
+# ── Editors / misc ────────────────────────────────────────────────────────────
+*~
+*.swp
+*.swo
+.project
+.classpath
