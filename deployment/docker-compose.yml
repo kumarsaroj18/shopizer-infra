@@ -59,6 +59,7 @@ services:
   # ── Spring Boot Backend ────────────────────────────────────────────────────
   shopizer-backend:
     image: shopizer-backend:${IMAGE_TAG_BACKEND:-latest}
+    pull_policy: never
     container_name: shopizer-backend
     restart: unless-stopped
     networks:
@@ -123,6 +124,7 @@ services:
   # are required. See deployment/frontend/nginx.conf for the full config.
   shopizer-frontend:
     image: shopizer-frontend:${IMAGE_TAG_FRONTEND:-latest}
+    pull_policy: never
     container_name: shopizer-frontend
     restart: unless-stopped
     networks:

@@ -92,7 +92,7 @@ pull_and_load() {
   local SERVICE="$1"        # backend | admin | react
   local TAG="$2"            # e.g. 3.2.5-a1b2c3d4
   local ARTIFACT_PATTERN="$3"   # e.g. docker-image-backend-*
-  local REPO_VAR="GITHUB_REPO_${SERVICE^^}"
+  local REPO_VAR="GITHUB_REPO_$(echo "$SERVICE" | tr '[:lower:]' '[:upper:]')"
   local REPO="${!REPO_VAR:-}"
   local CACHE_DIR="${SCRIPT_DIR}/.image-cache"
 
