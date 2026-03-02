@@ -4,6 +4,74 @@
 
 ---
 
+## 0. Quick-Start (Local Dev Compose)
+
+The root [`docker-compose.yml`](docker-compose.yml) is the fastest way to run the **complete Shopizer stack** on your machine using images built from the individual repo scripts.
+
+### Step 1 — Build each image
+
+```bash
+# From the root of your shopizer-repo checkout:
+cd shopizer              && ./build-image-from-ci.sh <github-owner> shopizer
+cd ../shopizer-admin        && ./build-image-from-ci.sh <github-owner> shopizer-admin
+cd ../shopizer-shop-reactjs && ./build-image-from-ci.sh <github-owner> shopizer-shop-reactjs
+```
+
+This produces three local images: `shopizer:ci-latest`, `shopizer-admin:ci-latest`, and `shopizer-shop-reactjs:ci-latest`.
+
+### Step 2 — Start all services
+
+```bash
+cd shopizer-infra
+docker compose up -d
+```
+
+### Service URLs
+
+| Service | URL |
+|---|---|
+| Backend (Swagger UI) | http://localhost:8080/swagger-ui.html |
+| Backend (Health) | http://localhost:8080/actuator/health |
+| Admin UI (Angular) | http://localhost:4200 |
+| React Shop | http://localhost:3000 |
+| MySQL | `localhost:3306` (internal only) |
+
+### Default credentials
+
+| Role | Email | Password |
+|---|---|---|
+| Admin | `admin@shopizer.com` | `password` |
+| Customer | `john.doe@example.com` | `password123` |
+
+### Environment variables
+
+All env vars in `docker-compose.yml` are sensible defaults. Override them inline or with a `.env` file:
+
+| Variable | Service | Default | Notes |
+|---|---|---|---|
+| `APP_BASE_URL` | admin, react | `http://localhost:8080[/api]` | Must be browser-reachable |
+| `APP_MERCHANT` | react | `DEFAULT` | Merchant code |
+| `APP_PAYMENT_TYPE` | react | `STRIPE` | `STRIPE` or `NUVEI` |
+| `APP_STRIPE_KEY` | react | _(empty)_ | Your Stripe publishable key |
+| `APP_DEFAULT_LANGUAGE` | admin | `en` | UI language |
+
+### Stop / tear down
+
+```bash
+# Stop all containers (keep data)
+docker compose stop
+
+# Remove containers (keep volumes)
+docker compose down
+
+# Full reset including MySQL data
+docker compose down -v
+```
+
+> **Difference from `deployment/docker-compose.yml`**: The root compose uses images built by the per-repo `build-image-from-ci.sh` scripts (tagged `ci-latest` / `local-latest`) and is intended for local development and testing. The `deployment/` compose is the artifact-based CD stack used by the full `deploy-local.sh` pipeline with versioned image tags.
+
+---
+
 ## 1. High-level Architecture
 
 ```mermaid
@@ -100,10 +168,13 @@ CI (Continuous Integration)           CD (Continuous Delivery)
 ## 3. Directory Structure
 
 ```
+docker-compose.yml             ← quick-start full-stack compose (ci-latest images)
+                                  runs mysql + shopizer + shopizer-admin + shopizer-shop-reactjs
+
 deployment/
 ├── .env.example                   ← copy to .env and fill in secrets
 ├── .env                           ← git-ignored; your actual values
-├── docker-compose.yml             ← unified stack definition
+├── docker-compose.yml             ← CD pipeline stack (versioned artifact-based images)
 ├── deploy-local.sh                ← main deployment script
 ├── rollback.sh                    ← tag-switch rollback script
 │

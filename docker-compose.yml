@@ -1,0 +1,117 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Shopizer – Full-Stack Local Dev Compose
+#
+# Runs all four services using images built by the individual repo scripts:
+#
+#   shopizer:ci-latest               ← shopizer/build-image-from-ci.sh
+#   shopizer-admin:ci-latest         ← shopizer-admin/build-image-from-ci.sh
+#   shopizer-shop-reactjs:ci-latest  ← shopizer-shop-reactjs/build-image-from-ci.sh
+#
+# Quick-start (build all images first, then start):
+#   cd ../shopizer              && ./build-image-from-ci.sh <owner> shopizer
+#   cd ../shopizer-admin        && ./build-image-from-ci.sh <owner> shopizer-admin
+#   cd ../shopizer-shop-reactjs && ./build-image-from-ci.sh <owner> shopizer-shop-reactjs
+#   cd ../shopizer-infra        && docker compose up -d
+#
+# Service URLs:
+#   Backend (Swagger)   http://localhost:8080/swagger-ui.html
+#   Admin UI            http://localhost:4200
+#   React Shop          http://localhost:3000
+#   MySQL               localhost:3306  (internal only)
+#
+# See README.md § "Quick-Start (Local Dev Compose)" for full details.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── MySQL 8 ──────────────────────────────────────────────────────────────
+  mysql:
+    image: mysql:8.0
+    container_name: shopizer-mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: SALESMANAGER
+      MYSQL_USER: app_user
+      MYSQL_PASSWORD: app_password
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "--password=root", "--silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ── Spring Boot Backend ───────────────────────────────────────────────────
+  shopizer-backend:
+    image: shopizer:ci-latest
+    pull_policy: never
+    container_name: shopizer-backend
+    restart: always
+    ports:
+      - "8080:8080"
+    environment:
+      - SPRING_PROFILES_ACTIVE=mysql
+      - "db.jdbcUrl=jdbc:mysql://mysql:3306/SALESMANAGER?autoReconnect=true&serverTimezone=UTC&useUnicode=true&characterEncoding=UTF-8&useSSL=false&allowPublicKeyRetrieval=true"
+      - "db.user=app_user"
+      - "db.password=app_password"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  # ── Angular Admin UI ──────────────────────────────────────────────────────
+  # Image built by: shopizer-admin/build-image-from-ci.sh
+  # Env vars are injected at container startup via envsubst into env.js.
+  # APP_BASE_URL must be reachable from the browser (use localhost, not the
+  # Docker service name) because Angular calls the API from the client side.
+  shopizer-admin:
+    image: shopizer-admin:ci-latest
+    pull_policy: never
+    container_name: shopizer-admin
+    restart: always
+    ports:
+      - "4200:80"
+    environment:
+      - APP_BASE_URL=http://localhost:8080/api
+      - APP_SHIPPING_URL=
+      - APP_MAP_API_KEY=
+      - APP_DEFAULT_LANGUAGE=en
+    depends_on:
+      - shopizer-backend
+
+  # ── React Storefront ──────────────────────────────────────────────────────
+  # Image built by: shopizer-shop-reactjs/build-image-from-ci.sh
+  # Env vars are injected at container startup by env.sh → window._env_.
+  # APP_BASE_URL must be reachable from the browser (use localhost, not the
+  # Docker service name) because React calls the API from the client side.
+  shopizer-shop-reactjs:
+    image: shopizer-shop-reactjs:ci-latest
+    pull_policy: never
+    container_name: shopizer-shop-reactjs
+    restart: always
+    ports:
+      - "3000:80"
+    environment:
+      - APP_BASE_URL=http://localhost:8080
+      - APP_API_VERSION=/api/v1/
+      - APP_MERCHANT=DEFAULT
+      - APP_PAYMENT_TYPE=STRIPE
+      - APP_STRIPE_KEY=
+      - APP_MAP_API_KEY=
+      - APP_PRODUCT_GRID_LIMIT=15
+      - APP_PRODUCTION=false
+      - APP_NUVEI_TERMINAL_ID=
+      - APP_NUVEI_SECRET=
+      - APP_THEME_COLOR=#D1D1D1
+    depends_on:
+      - shopizer-backend
+
+volumes:
+  mysql_data:
