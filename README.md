@@ -4,6 +4,94 @@
 
 ---
 
+## IaC Provisioning (Recommended)
+
+The repository ships a complete **Infrastructure-as-Code** layer that provisions
+the entire local environment — Colima VM, Docker context, tool dependencies, and
+the application stack — from a single command.
+
+```
+infra/
+├── colima.yaml    ← Colima VM specification (CPU, memory, disk, arch, runtime)
+└── Brewfile       ← Homebrew tool manifest (colima, docker, gh, jq, …)
+
+provision.sh       ← Idempotent full-stack provisioner (entry point)
+teardown.sh        ← Graceful teardown (containers → VM → destroy)
+status.sh          ← Live health dashboard  (./status.sh)
+```
+
+### First-time setup (single command)
+
+```bash
+cd shopizer-infra
+./provision.sh
+```
+
+This will:
+
+1. Detect macOS + architecture
+2. Install all CLI tools via `infra/Brewfile` (`brew bundle`)
+3. Copy `infra/colima.yaml` to the **`shopizer` Colima profile** (`~/.colima/shopizer/`)
+4. Start the Colima VM (`colima start shopizer`) with the declared specs
+5. Set the Docker context to `colima-shopizer`
+6. Initialise `deployment/.env` from `.env.example` (if absent)
+7. Detect whether images are loaded; pull from GitHub Actions if needed
+8. Run `docker compose up -d` in `deployment/`
+9. Wait for the backend health check and print all service URLs
+
+The script is **idempotent** — running it again reconciles any drift without
+disrupting a running stack.
+
+### Common operations
+
+| Goal | Command |
+|---|---|
+| Full first-time setup | `./provision.sh` |
+| Already have images locally | `./provision.sh --skip-images` |
+| Skip Homebrew install | `./provision.sh --skip-brew` |
+| Provision VM only, no app | `./provision.sh --only-infra` |
+| Apply updated `colima.yaml` | `./provision.sh --reconfigure` |
+| Check stack health | `./status.sh` |
+| Machine-readable health | `./status.sh --json` |
+| Stop containers, keep VM | `./teardown.sh` |
+| Stop containers + wipe data | `./teardown.sh --volumes` |
+| Stop containers + pause VM | `./teardown.sh --stop-colima` |
+| Full destroy (reclaim disk) | `./teardown.sh --destroy-vm -y` |
+
+### VM specification (`infra/colima.yaml`)
+
+The Colima VM is declared in `infra/colima.yaml` and versioned with the repo.
+Edit it to tune resources, then apply with `./provision.sh --reconfigure`.
+
+| Setting | Default | Notes |
+|---|---|---|
+| `cpu` | `2` | vCPU cores; increase to 4 for parallel Maven builds |
+| `memory` | `4` | GiB; 6 GiB recommended for concurrent builds |
+| `disk` | `60` | GiB; do **not** shrink a running profile |
+| `arch` | `host` | Auto-detects (aarch64 on Apple Silicon, x86_64 on Intel) |
+| `vmType` | `qemu` | Change to `vz` on macOS 13+ for faster I/O |
+| `mountType` | `sshfs` | Change to `virtiofs` with `vmType: vz` |
+| `runtime` | `docker` | Do not change |
+
+### Tool dependencies (`infra/Brewfile`)
+
+All CLI tools are declared in `infra/Brewfile`.  Apply independently with:
+
+```bash
+brew bundle --file infra/Brewfile
+```
+
+| Tool | Purpose |
+|---|---|
+| `colima` | Lightweight macOS container runtime (replaces Docker Desktop) |
+| `docker` | Docker CLI |
+| `docker-compose` | Compose v2 plugin |
+| `gh` | GitHub CLI (downloads CI image artifacts) |
+| `jq` | JSON processor |
+| `wget` | Used in Docker healthchecks |
+
+---
+
 ## 0. Quick-Start (Local Dev Compose)
 
 The root [`docker-compose.yml`](docker-compose.yml) is the fastest way to run the **complete Shopizer stack** on your machine using images built from the individual repo scripts.
@@ -168,26 +256,32 @@ CI (Continuous Integration)           CD (Continuous Delivery)
 ## 3. Directory Structure
 
 ```
-docker-compose.yml             ← quick-start full-stack compose (ci-latest images)
+infra/
+├── colima.yaml                ← IaC: Colima VM specification (CPU/memory/disk/arch)
+└── Brewfile                   ← IaC: Homebrew tool manifest (brew bundle)
+
+provision.sh                   ← Idempotent full-stack provisioner  (./provision.sh)
+teardown.sh                    ← Graceful teardown at any level      (./teardown.sh)
+status.sh                      ← Live health dashboard               (./status.sh)
+
+docker-compose.yml             ← Quick-start compose (ci-latest images)
                                   runs mysql + shopizer + shopizer-admin + shopizer-shop-reactjs
 
 deployment/
 ├── .env.example                   ← copy to .env and fill in secrets
 ├── .env                           ← git-ignored; your actual values
 ├── docker-compose.yml             ← CD pipeline stack (versioned artifact-based images)
-├── deploy-local.sh                ← main deployment script
+├── deploy-local.sh                ← artifact pull + deployment script
 ├── rollback.sh                    ← tag-switch rollback script
 │
-├── backend/
-│   └── Dockerfile                 ← artifact-based; expects shopizer.jar
-│
 ├── frontend/                      ← combined Angular admin + React shop
-│   ├── Dockerfile                 ← serves admin (8081) and react (8082)
+│   ├── Dockerfile                 ← serves admin (8081) and react (8082)  [unique to infra]
 │   └── nginx.conf                 ← two server{} blocks; no base-href changes needed
 │
 └── reference-workflows/           ← copy these to the respective repos
-    ├── cd-admin.yml               → shopizer-admin/.github/workflows/cd-frontend.yml
-    └── cd-react.yml               → shopizer-shop-reactjs/.github/workflows/cd-frontend.yml
+    ├── cd-backend.yml             → shopizer/.github/workflows/cd.yml
+    ├── cd-admin.yml               → shopizer-admin/.github/workflows/cd.yml
+    └── cd-react.yml               → shopizer-shop-reactjs/.github/workflows/cd.yml
 ```
 
 ---
@@ -227,20 +321,19 @@ or rolling back. This makes it unambiguous exactly what code is running.
 
 ### 5.1 One-time prerequisites
 
+> If you use the IaC provisioner (`./provision.sh`) these steps are automated.
+> Follow them manually only if you prefer a hands-on approach.
+
 ```bash
-# Install Colima
-brew install colima
+# Install Colima + Docker CLI + GitHub CLI via the Brewfile
+brew bundle --file infra/Brewfile
 
-# Install Docker CLI (no Docker Desktop needed)
-brew install docker docker-compose
+# Authenticate GitHub CLI
+gh auth login
 
-# Install GitHub CLI
-brew install gh
-gh auth login        # authenticate once
-
-# Create a Docker context that points to Colima
-colima start --cpu 2 --memory 4 --disk 60
-docker context use colima
+# Start the 'shopizer' Colima profile (specs from infra/colima.yaml)
+colima start shopizer --cpu 2 --memory 4 --disk 60
+docker context use colima-shopizer
 ```
 
 ### 5.2 Configure the CD workflow in each repo
@@ -265,9 +358,9 @@ docker context use colima
 
    > **CI workflow name must match** `workflow_run.workflows` in the CD file:
    >
-   > | Repo | CI workflow name | CD trigger value |
+   > | Repo | CI workflow name (`name:` in ci.yml) | CD trigger value |
    > |---|---|---|
-   > | shopizer | `CI Pipeline` | `"CI Pipeline"` ✔ |
+   > | shopizer | `Shopizer-Backend-CI` | `"Shopizer-Backend-CI"` ✔ |
    > | shopizer-admin | `CI` | `"CI"` ✔ |
    > | shopizer-shop-reactjs | `CI/CD Pipeline` | `"CI/CD Pipeline"` ✔ |
 
@@ -283,9 +376,12 @@ The `cd-frontend.yml` workflow downloads artifacts from **both** CI repos:
 
 All CI workflows already upload artifacts matching these patterns. ✔
 
-> **Note on Dockerfile**: The combined frontend Dockerfile lives in
-> `shopizer-infra/deployment/frontend/`. The CD workflows sparse-checkout
-> that path from shopizer-infra automatically.
+> **Note on Dockerfiles**: Each source repo owns its own `Dockerfile.ci` (used by its CD workflow
+> for standalone images). The **combined frontend** `Dockerfile` lives in
+> `shopizer-infra/deployment/frontend/` — it is unique to infra because it serves both Angular admin
+> (port 8081) and React shop (port 8082) from a single Nginx container. The CD workflows for admin
+> and react checkout the source repo's `Dockerfile.ci` directly; the infra combined Dockerfile is
+> used when deploying the full CD stack via `deploy-local.sh`.
 
 ### 5.4 Configure deployment environment
 
@@ -419,6 +515,24 @@ docker compose -f deployment/docker-compose.yml up -d --no-deps shopizer-fronten
 
 ## 10. Teardown
 
+Use `teardown.sh` for any level of teardown (see `./teardown.sh --help`):
+
+```bash
+# Stop containers, keep volumes and VM (fastest restart)
+./teardown.sh
+
+# Stop containers AND wipe all MySQL data
+./teardown.sh --volumes
+
+# Stop containers + pause the Colima VM (reclaims ~4 GB RAM)
+./teardown.sh --stop-colima
+
+# Complete destroy – removes VM + context + all state (run provision.sh to rebuild)
+./teardown.sh --destroy-vm -y
+```
+
+Or with raw `docker compose` if you prefer:
+
 ```bash
 # Stop all containers (keep volumes / data)
 docker compose -f deployment/docker-compose.yml stop
@@ -430,7 +544,7 @@ docker compose -f deployment/docker-compose.yml down
 docker compose -f deployment/docker-compose.yml down -v
 
 # Stop Colima VM entirely
-colima stop
+colima stop shopizer
 ```
 
 ---
@@ -501,18 +615,42 @@ mkcert localhost
 # Mount into the shopizer-frontend container and update nginx.conf to listen on 443
 ```
 
-### C – Self-hosted runner (full automation)
+### C – Self-hosted runner setup (required for CD)
 
-Run a GitHub Actions self-hosted runner on your Mac to make the entire CD
-workflow execute locally. Images are built, loaded, and deployed without any
-manual `deploy-local.sh` invocation.
+All three CD reference workflows run on **`runs-on: self-hosted`** — they build
+images directly into the Colima Docker daemon and run `docker compose up`
+without any tar export or manual download step.
+
+**One-time registration** (per repo that has a CD workflow):
 
 ```bash
-# From your GitHub repo settings → Actions → Runners → New self-hosted runner
-# Follow the macOS instructions – registers as a persistent LaunchAgent
+# Go to: GitHub repo → Settings → Actions → Runners → New self-hosted runner
+# Choose: macOS  → copy the registration commands and run them in your terminal
+# The runner registers as a persistent LaunchAgent service
 ```
 
-Change `runs-on: ubuntu-latest` to `runs-on: self-hosted` in all CD workflows.
+**Required GitHub repo settings** (per repo):
+
+| Setting type | Name | Value / notes |
+|---|---|---|
+| Variable | `INFRA_DIR` | Absolute path to shopizer-infra on your Mac<br>e.g. `/Users/yourname/workspace/shopizer-infra` |
+| Secret | `CROSS_REPO_TOKEN` | Fine-grained PAT with **Actions (read)** on the *other* frontend repo<br>admin repo needs read access on reactjs repo, and vice-versa |
+
+Create the PAT at: *Settings → Developer settings → Personal access tokens →
+Fine-grained tokens → Repository access: shopizer-shop-reactjs → Permissions:
+Actions → Read-only*.
+
+**Verify runner and Colima are up**:
+
+```bash
+# Check runner service
+./runsvc.sh status        # or: launchctl list | grep actions.runner
+
+# Check Colima
+colima status shopizer
+docker context use colima-shopizer
+docker info | grep -i "server version"
+```
 
 ### D – Watchtower (automatic container updates)
 

@@ -1,0 +1,227 @@
+# =============================================================================
+# CD Workflow – Backend (shopizer)
+#
+# LOCATION: Reference copy. Copy to:
+#   shopizer/.github/workflows/cd.yml
+#
+# Trigger: successful completion of the "Shopizer-Backend-CI" CI workflow.
+#
+# Runs on a self-hosted GitHub Actions runner on your Mac (Colima VM).
+# The Docker image is built directly into the Colima daemon — no tar export,
+# no artifact upload, no manual download step needed.
+#
+# Prerequisites on the self-hosted runner machine:
+#   1. GitHub Actions runner registered (see README § Self-hosted runner setup)
+#   2. Colima running:  colima status shopizer | grep running
+#   3. Docker context:  docker context use colima-shopizer
+#   4. shopizer-infra deployment stack initialised:
+#        $INFRA_DIR/deployment/.env   (created by provision.sh)
+#        $INFRA_DIR/deployment/docker-compose.yml
+#
+# Required GitHub repo secret:
+#   GITHUB_TOKEN  — automatically provided by Actions, used for artifact download
+#
+# Required GitHub repo variable (Settings → Variables → Actions):
+#   INFRA_DIR     — absolute path to shopizer-infra on the runner Mac
+#                   e.g. /Users/yourname/workspace/shopizer-infra
+#                   (fallback: $HOME/shopizer-infra)
+# =============================================================================
+name: CD – Backend (shopizer)
+
+on:
+  workflow_run:
+    # ⚠️  Must match `name:` in shopizer/.github/workflows/ci.yml exactly
+    workflows: ["Shopizer-Backend-CI"]
+    types: [completed]
+    branches: [main, master, develop]
+  workflow_dispatch:
+    inputs:
+      ci_run_id:
+        description: 'CI workflow run ID to deploy (leave blank for latest)'
+        required: false
+        type: string
+
+env:
+  IMAGE_NAME: shopizer-backend
+  # Routes all docker CLI calls to the Colima VM socket
+  DOCKER_CONTEXT: colima-shopizer
+
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+# ─────────────────────────────────────────────────────────────────────────────
+
+  # ── Guard: runs on GitHub's servers (no Docker needed, fast) ─────────────
+  guard:
+    name: Check CI status
+    runs-on: ubuntu-latest
+    outputs:
+      should_deploy: ${{ steps.check.outputs.should_deploy }}
+      ci_run_id:     ${{ steps.check.outputs.ci_run_id }}
+    steps:
+      - name: Evaluate trigger
+        id: check
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            if [[ "${{ github.event.workflow_run.conclusion }}" != "success" ]]; then
+              echo "CI did not succeed – skipping deploy"
+              echo "should_deploy=false" >> $GITHUB_OUTPUT
+            else
+              echo "should_deploy=true"  >> $GITHUB_OUTPUT
+              echo "ci_run_id=${{ github.event.workflow_run.id }}" >> $GITHUB_OUTPUT
+            fi
+          else
+            # workflow_dispatch: always deploy
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+            echo "ci_run_id=${{ github.event.inputs.ci_run_id }}" >> $GITHUB_OUTPUT
+          fi
+
+  # ── Build & Deploy: runs on the self-hosted Mac runner with Colima ────────
+  build-and-deploy:
+    name: Build image & deploy to Colima
+    runs-on: self-hosted
+    needs: guard
+    if: needs.guard.outputs.should_deploy == 'true'
+
+    env:
+      # Override via GitHub repo variable Settings → Variables → Actions
+      INFRA_DIR: ${{ vars.INFRA_DIR }}
+
+    steps:
+      # ── Checkout source repo ────────────────────────────────────────────────
+      # Dockerfile.ci expects these files in the repo root during docker build:
+      #   .ci-download/shopizer.jar   ← placed by the "Download JAR" step below
+      #   sm-shop/SALESMANAGER.h2.db  ← H2 seed database
+      #   sm-shop/files/              ← static file assets
+      - name: Checkout shopizer
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            Dockerfile.ci
+            sm-shop/SALESMANAGER.h2.db
+            sm-shop/files
+          sparse-checkout-cone-mode: false
+
+      # ── Extract version from pom.xml ────────────────────────────────────────
+      - name: Extract version
+        id: meta
+        run: |
+          VERSION=$(grep -m1 '<version>' sm-shop/pom.xml \
+                      | sed 's/.*<version>\(.*\)<\/version>.*/\1/' \
+                      | tr -d '[:space:]')
+          VERSION="${VERSION:-1.0.0}"
+          SHORT_SHA=$(echo "${{ github.event.workflow_run.head_sha || github.sha }}" | cut -c1-8)
+          echo "version=${VERSION}"                >> $GITHUB_OUTPUT
+          echo "image_tag=${VERSION}-${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "Building: ${{ env.IMAGE_NAME }}:${VERSION}-${SHORT_SHA}"
+
+      # ── Resolve CI run ID ───────────────────────────────────────────────────
+      - name: Resolve CI run ID
+        id: resolve_run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RUN_ID="${{ needs.guard.outputs.ci_run_id }}"
+          if [[ -z "$RUN_ID" ]]; then
+            echo "No run ID provided – resolving latest successful CI run..."
+            RUN_ID=$(gh run list \
+              --repo "${{ github.repository }}" \
+              --workflow "Shopizer-Backend-CI" \
+              --status success --limit 1 \
+              --json databaseId --jq '.[0].databaseId')
+          fi
+          echo "Using CI run ID: ${RUN_ID}"
+          echo "run_id=${RUN_ID}" >> $GITHUB_OUTPUT
+
+      # ── Download JAR from CI artifact ──────────────────────────────────────
+      # CI uploads: name=shopizer-{VERSION}-{SHA}, path=sm-shop/target/shopizer.jar
+      - name: Download JAR artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p artifacts
+          gh run download "${{ steps.resolve_run.outputs.run_id }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "shopizer-*" \
+            --dir artifacts/
+
+          JAR=$(find artifacts/ -name "shopizer.jar" | head -1)
+          if [[ -z "$JAR" ]]; then
+            echo "ERROR: shopizer.jar not found in artifact"
+            ls -R artifacts/
+            exit 1
+          fi
+
+          # Stage into the path Dockerfile.ci expects: .ci-download/shopizer.jar
+          mkdir -p .ci-download
+          cp "$JAR" .ci-download/shopizer.jar
+          echo "Staged: $(du -sh .ci-download/shopizer.jar)"
+
+      # ── Build image directly into Colima Docker daemon ─────────────────────
+      - name: Build shopizer-backend image
+        run: |
+          docker build \
+            --build-arg APP_VERSION="${{ steps.meta.outputs.image_tag }}" \
+            --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -t "${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.image_tag }}" \
+            -t "${{ env.IMAGE_NAME }}:latest" \
+            -f Dockerfile.ci \
+            .
+          echo "Image built:"
+          docker images "${{ env.IMAGE_NAME }}" --format "  {{.Repository}}:{{.Tag}}  {{.Size}}"
+
+      # ── Update .env and rolling restart backend ─────────────────────────────
+      - name: Deploy to Colima
+        run: |
+          INFRA="${INFRA_DIR:-$HOME/shopizer-infra}"
+          ENV_FILE="$INFRA/deployment/.env"
+
+          if [[ ! -f "$ENV_FILE" ]]; then
+            echo "ERROR: $ENV_FILE not found. Run provision.sh first."
+            exit 1
+          fi
+
+          # Write the canonical image tag into .env (preserves all other values)
+          if grep -q "^IMAGE_TAG_BACKEND=" "$ENV_FILE"; then
+            sed -i '' "s|^IMAGE_TAG_BACKEND=.*|IMAGE_TAG_BACKEND=${{ steps.meta.outputs.image_tag }}|" "$ENV_FILE"
+          else
+            echo "IMAGE_TAG_BACKEND=${{ steps.meta.outputs.image_tag }}" >> "$ENV_FILE"
+          fi
+
+          echo "Updated IMAGE_TAG_BACKEND → ${{ steps.meta.outputs.image_tag }}"
+
+          # Rolling restart of shopizer-backend only (MySQL stays untouched)
+          docker compose \
+            -f "$INFRA/deployment/docker-compose.yml" \
+            --env-file "$ENV_FILE" \
+            up -d --no-deps shopizer-backend
+
+      # ── Wait for backend health ──────────────────────────────────────────────
+      - name: Wait for backend health
+        run: |
+          echo "Waiting for shopizer-backend to become healthy (max 120s)..."
+          for i in $(seq 1 24); do
+            STATUS=$(docker inspect --format='{{.State.Health.Status}}' shopizer-backend 2>/dev/null || echo 'not_found')
+            if [[ "$STATUS" == "healthy" ]]; then
+              echo "✔ shopizer-backend is healthy"
+              exit 0
+            fi
+            printf "  [%2d/24] %s\n" "$i" "$STATUS"
+            sleep 5
+          done
+          echo "⚠ Backend not healthy after 120s – last 50 log lines:"
+          docker logs --tail 50 shopizer-backend
+          exit 1
+
+      # ── Job summary ──────────────────────────────────────────────────────────
+      - name: Write job summary
+        if: always()
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          ## 🚀 Backend Deployed to Colima – shopizer-backend
+
+          | Field      | Value |
+          |------------|-------|
+          | Image tag  | `${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.image_tag }}` |
+          | Swagger UI | http://localhost:8080/swagger-ui/index.html |
+          | Health     | http://localhost:8080/actuator/health |
+          EOF

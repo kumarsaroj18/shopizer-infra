@@ -1,0 +1,72 @@
+# =============================================================================
+# Shopizer – Colima VM Specification  (Infrastructure as Code)
+#
+# This file is the canonical, version-controlled declaration of the Colima
+# virtual machine that runs the Shopizer Docker environment.
+#
+# Applied by:   ../provision.sh   (copies to ~/.colima/shopizer/colima.yaml)
+# Profile name: shopizer          (isolated from any default Colima instance)
+#
+# Tuning guide
+# ─────────────────────────────────────────────────────────────────────────────
+# cpu          - 2 cores is sufficient for MySQL + Spring Boot + 2 SPAs.
+#                Increase to 4 if compilation or heavy indexing is needed.
+# memory       - 4 GB keeps MySQL (256 MB) + JVM (768 MB) + Nginx well within
+#                headroom. Set to 6 for parallel builds.
+# disk         - 60 GB covers base images (~3 GB), all app images (~1.5 GB),
+#                MySQL data, and build cache. Do NOT shrink a running profile.
+# arch         - "host" auto-detects the CPU architecture (aarch64 on Apple
+#                Silicon, x86_64 on Intel). Override explicitly if needed.
+# vmType       - "qemu"   works on all macOS versions (default, safest).
+#                "vz"     requires macOS 13 Ventura+ and is faster on Apple
+#                         Silicon; change this if you are on a modern Mac and
+#                         want faster I/O.
+# mountType    - "sshfs"  works everywhere (default, safest).
+#                "virtiofs" requires vmType=vz (macOS 13+) and is 3-5× faster
+#                         for bind-mounts. Recommended if vmType is changed.
+# rosetta      - Enables transparent x86 emulation inside the VM when running
+#                on Apple Silicon. Set to true only if you need to run images
+#                that have no arm64 build (rare for this stack).
+# =============================================================================
+
+# ── Compute resources ─────────────────────────────────────────────────────────
+cpu: 2
+memory: 4
+disk: 60
+
+# ── Architecture & virtualisation ────────────────────────────────────────────
+arch: host          # auto → aarch64 on Apple Silicon, x86_64 on Intel
+vmType: qemu        # change to "vz" on macOS 13+ for faster boot/IO
+mountType: sshfs    # change to "virtiofs" when vmType=vz
+rosetta: false
+
+# ── Container runtime ─────────────────────────────────────────────────────────
+runtime: docker
+
+# ── Auto-activate the Docker context after start ─────────────────────────────
+autoActivate: true
+
+# ── Kubernetes – disabled; this stack uses plain Docker Compose ───────────────
+kubernetes:
+  enabled: false
+
+# ── Networking ────────────────────────────────────────────────────────────────
+network:
+  # address: false keeps the VM on a NAT interface (ports forwarded via 127.0.0.1)
+  # Set to true only if you need direct VM IP access (e.g. self-hosted runner)
+  address: false
+  dns: []
+  dnsHosts: {}
+
+# ── Host SSH-agent forwarding ─────────────────────────────────────────────────
+forwardAgent: false
+
+# ── Docker daemon extra configuration ────────────────────────────────────────
+# Merged into /etc/docker/daemon.json inside the Colima VM.
+docker:
+  log-driver: json-file
+  log-opts:
+    max-size: "10m"
+    max-file: "3"
+  # Allow insecure access to a local registry if you are using one
+  # insecure-registries: ["localhost:5000"]

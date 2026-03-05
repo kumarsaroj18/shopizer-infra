@@ -1,0 +1,37 @@
+# =============================================================================
+# Shopizer – Homebrew Brewfile  (Infrastructure as Code – Tool Dependencies)
+#
+# Declares every CLI tool required to provision and operate the Shopizer
+# local environment. Apply with:
+#
+#   brew bundle --file infra/Brewfile
+#
+# provision.sh calls this automatically.
+# =============================================================================
+
+# ── Package manager ────────────────────────────────────────────────────────────
+# tap "homebrew/bundle"  # already built-in; listed for documentation only
+
+# ── Container runtime ──────────────────────────────────────────────────────────
+# Colima: lightweight macOS container runtime (replaces Docker Desktop)
+brew "colima"
+
+# QEMU: virtualisation backend required by Colima's default vmType=qemu
+brew "qemu"
+
+# Docker CLI (no Docker Desktop required)
+brew "docker"
+
+# Docker Compose plugin (v2)
+brew "docker-compose"
+
+# ── CI/CD integration ──────────────────────────────────────────────────────────
+# GitHub CLI – used by deploy-local.sh to download image artifacts from Actions
+brew "gh"
+
+# ── Convenience / diagnostics ─────────────────────────────────────────────────
+# jq – lightweight JSON processor (used in helper scripts)
+brew "jq"
+
+# wget – used in Docker healthchecks (to supplement curl)
+brew "wget"

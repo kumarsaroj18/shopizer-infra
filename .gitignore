@@ -16,9 +16,6 @@ deployment/.image-cache/
 deployment/.rollback-history
 
 # Staged artifact directories placed into build context by CD workflows
-deployment/backend/shopizer.jar
-deployment/admin/dist/
-deployment/react/build/
 deployment/frontend/admin-dist/
 deployment/frontend/react-build/
 

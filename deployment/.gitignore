@@ -8,6 +8,5 @@
 .rollback-history
 
 # Staged artifact files placed here by CD workflow during docker build
-backend/shopizer.jar
-admin/dist/
-react/build/
+frontend/admin-dist/
+frontend/react-build/

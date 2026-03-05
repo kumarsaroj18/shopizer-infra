@@ -7,7 +7,7 @@
 # ⚠️  Key facts:
 #   • CI workflow name: "CI/CD Pipeline"  (not "CI Pipeline")
 #   • CI artifact pattern: shopizer-react-build-<run_number> (path: build/ flat)
-#   • Dockerfile lives in shopizer-infra (not in the react source repo)
+#   • Dockerfile.ci lives in the shopizer-shop-reactjs source repo (not shopizer-infra)
 # ─────────────────────────────────────────────────────────────────────────────
 name: CD – React Shop (shopizer-shop-reactjs)
 
@@ -25,10 +25,9 @@ on:
         type: string
 
 env:
-  IMAGE_NAME: shopizer-react
-  NODE_VERSION: '18'
-  # Infra repo that owns the Dockerfile + nginx.conf for all services
-  INFRA_REPO: ${{ github.repository_owner }}/shopizer-infra
+  IMAGE_NAME: shopizer-frontend
+  ADMIN_REPO: ${{ github.repository_owner }}/shopizer-admin
+  DOCKER_CONTEXT: colima-shopizer
 
 jobs:
   guard:
@@ -54,48 +53,32 @@ jobs:
             echo "ci_run_id=${CI_RUN}" >> $GITHUB_OUTPUT
           fi
 
-  build-image:
-    name: Build Docker Image
-    runs-on: ubuntu-latest
+  build-and-deploy:
+    name: Build combined frontend image and deploy to Colima
+    runs-on: self-hosted
     needs: guard
     if: needs.guard.outputs.should_deploy == 'true'
-
-    outputs:
-      image_tag: ${{ steps.meta.outputs.image_tag }}
+    env:
+      INFRA_DIR: ${{ vars.INFRA_DIR }}
 
     steps:
-      # ── Checkout (package.json only from react; Dockerfile from shopizer-infra) ─
-      - name: Checkout shopizer-shop-reactjs (sparse – package.json)
+      - name: Checkout shopizer-shop-reactjs
         uses: actions/checkout@v4
         with:
           sparse-checkout: |
             package.json
           sparse-checkout-cone-mode: false
 
-      # ── Extract version from package.json ─────────────────────────────────────
       - name: Extract version
         id: meta
         run: |
-          RAW_VERSION=$(node -p "require('./package.json').version" 2>/dev/null || echo "")
-          VERSION=${RAW_VERSION:-1.0.0}
-          if [[ "$VERSION" == "undefined" ]]; then VERSION="1.0.0"; fi
-
+          RAW=$(node -p "require('./package.json').version" 2>/dev/null || echo "")
+          VERSION="${RAW:-1.0.0}"
+          [[ "$VERSION" == "undefined" ]] && VERSION="1.0.0"
           SHORT_SHA=$(echo "${{ github.event.workflow_run.head_sha || github.sha }}" | cut -c1-8)
-          echo "version=${VERSION}"                   >> $GITHUB_OUTPUT
-          echo "image_tag=${VERSION}-${SHORT_SHA}"    >> $GITHUB_OUTPUT
-          echo "short_sha=${SHORT_SHA}"               >> $GITHUB_OUTPUT
+          echo "version=${VERSION}"                >> $GITHUB_OUTPUT
+          echo "image_tag=${VERSION}-${SHORT_SHA}" >> $GITHUB_OUTPUT
 
-      # ── Checkout shopizer-infra for Dockerfile + nginx.conf ──────────────────
-      - name: Checkout shopizer-infra (Dockerfile + nginx.conf)
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.INFRA_REPO }}
-          path: shopizer-infra
-          sparse-checkout: |
-            deployment/react
-          sparse-checkout-cone-mode: false
-
-      # ── Resolve CI run ID ─────────────────────────────────────────────────────
       - name: Resolve CI run ID
         id: resolve_run
         env:
@@ -104,106 +87,110 @@ jobs:
           RUN_ID="${{ needs.guard.outputs.ci_run_id }}"
           if [[ -z "$RUN_ID" ]]; then
             RUN_ID=$(gh run list \
+              --repo "${{ github.repository }}" \
               --workflow "CI/CD Pipeline" \
-              --status success \
-              --limit 1 \
-              --json databaseId \
-              --jq '.[0].databaseId')
+              --status success --limit 1 \
+              --json databaseId --jq '.[0].databaseId')
           fi
           echo "run_id=${RUN_ID}" >> $GITHUB_OUTPUT
 
-      # ── Download build artifact (CI must upload as "shopizer-react-build-*") ──
-      - name: Download build artifact
-        uses: actions/download-artifact@v4
-        with:
-          run-id: ${{ steps.resolve_run.outputs.run_id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          pattern: "shopizer-react-build-*"
-          merge-multiple: true
-          path: artifacts/
-
-      - name: Stage build into Dockerfile build context
+      # ── Download react build from this repo ──────────────────────────────────
+      - name: Download react build artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "Downloaded files:"
-          find artifacts/ -type f | sort
-
-          # CI uploads path: build/ – upload-artifact v4 strips the directory
-          # so files land flat in artifacts/ (not in artifacts/build/).
-          mkdir -p shopizer-infra/deployment/react/build
-
-          if compgen -G "artifacts/*.tar.gz" > /dev/null; then
-            tar -xzf artifacts/*.tar.gz -C shopizer-infra/deployment/react/build/
-          elif [ -d "artifacts/build" ]; then
-            cp -r artifacts/build/. shopizer-infra/deployment/react/build/
+          INFRA="${INFRA_DIR:-$HOME/shopizer-infra}"
+          mkdir -p artifacts/react
+          gh run download "${{ steps.resolve_run.outputs.run_id }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "shopizer-react-build-*" \
+            --dir artifacts/react/
+          rm -rf "$INFRA/deployment/frontend/react-build"
+          mkdir -p "$INFRA/deployment/frontend/react-build"
+          if find artifacts/react -name "*.tar.gz" | grep -q .; then
+            tar -xzf "$(find artifacts/react -name "*.tar.gz" | head -1)" \
+              -C "$INFRA/deployment/frontend/react-build/"
+          elif [[ -d artifacts/react/build ]]; then
+            cp -r artifacts/react/build/. "$INFRA/deployment/frontend/react-build/"
           else
-            # Flat layout (upload-artifact v4 strips directory)
-            cp -r artifacts/. shopizer-infra/deployment/react/build/
+            cp -r artifacts/react/. "$INFRA/deployment/frontend/react-build/"
           fi
+          echo "React build: $(find $INFRA/deployment/frontend/react-build -type f | wc -l) files"
 
-          # Overwrite/create build-info.json with Docker image metadata
-          mkdir -p shopizer-infra/deployment/react/build/metadata
-          cat > shopizer-infra/deployment/react/build/metadata/build-info.json <<EOF
-          {
-            "version":    "${{ steps.meta.outputs.version }}",
-            "imageTag":   "${{ steps.meta.outputs.image_tag }}",
-            "gitSha":     "${{ github.event.workflow_run.head_sha || github.sha }}",
-            "shortSha":   "${{ steps.meta.outputs.short_sha }}",
-            "ciRunId":    "${{ steps.resolve_run.outputs.run_id }}",
-            "cdRunId":    "${{ github.run_id }}",
-            "builtAt":    "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "repository": "${{ github.repository }}"
-          }
-          EOF
-
-          echo "Build files: $(find shopizer-infra/deployment/react/build -type f | wc -l) files"
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build image
-        uses: docker/build-push-action@v5
-        with:
-          context: shopizer-infra/deployment/react
-          file:    shopizer-infra/deployment/react/Dockerfile
-          push: false
-          load: true
-          build-args: |
-            APP_VERSION=${{ steps.meta.outputs.image_tag }}
-          tags: |
-            ${{ env.IMAGE_NAME }}:latest
-            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.image_tag }}
-            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
-
-      - name: Export image tar
+      # ── Download latest admin dist (cross-repo) ───────────────────────────────
+      - name: Download latest admin dist artifact
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
         run: |
-          mkdir -p image-export
-          docker save \
-            ${{ env.IMAGE_NAME }}:latest \
-            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.image_tag }} \
-            | gzip > image-export/shopizer-react-${{ steps.meta.outputs.image_tag }}.tar.gz
+          INFRA="${INFRA_DIR:-$HOME/shopizer-infra}"
+          ADMIN_RUN=$(gh run list \
+            --repo "${{ env.ADMIN_REPO }}" \
+            --workflow "CI" \
+            --status success --limit 1 \
+            --json databaseId --jq '.[0].databaseId')
+          mkdir -p artifacts/admin
+          gh run download "$ADMIN_RUN" \
+            --repo "${{ env.ADMIN_REPO }}" \
+            --pattern "shopizer-admin-build-*" \
+            --dir artifacts/admin/
+          TARBALL=$(find artifacts/admin -name "*.tar.gz" | head -1)
+          if [[ -z "$TARBALL" ]]; then
+            echo "ERROR: admin dist tarball not found"; ls -R artifacts/admin; exit 1
+          fi
+          rm -rf "$INFRA/deployment/frontend/admin-dist"
+          mkdir -p "$INFRA/deployment/frontend/admin-dist"
+          tar -xzf "$TARBALL" -C "$INFRA/deployment/frontend/admin-dist/"
+          echo "Admin dist: $(find $INFRA/deployment/frontend/admin-dist -type f | wc -l) files"
 
-      - name: Upload Docker image artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: docker-image-react-${{ steps.meta.outputs.image_tag }}
-          path: image-export/shopizer-react-${{ steps.meta.outputs.image_tag }}.tar.gz
-          retention-days: 30
-          compression-level: 0
+      # ── Build combined image directly into Colima daemon ──────────────────────
+      - name: Build shopizer-frontend image
+        run: |
+          INFRA="${INFRA_DIR:-$HOME/shopizer-infra}"
+          docker build \
+            --build-arg APP_VERSION_REACT="${{ steps.meta.outputs.image_tag }}" \
+            -t "${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.image_tag }}" \
+            -t "${{ env.IMAGE_NAME }}:latest" \
+            -f "$INFRA/deployment/frontend/Dockerfile" \
+            "$INFRA/deployment/frontend"
+          docker images "${{ env.IMAGE_NAME }}" --format "  {{.Repository}}:{{.Tag}}  {{.Size}}"
+
+      - name: Deploy to Colima
+        run: |
+          INFRA="${INFRA_DIR:-$HOME/shopizer-infra}"
+          ENV_FILE="$INFRA/deployment/.env"
+          [[ ! -f "$ENV_FILE" ]] && echo "ERROR: $ENV_FILE not found. Run provision.sh first." && exit 1
+          if grep -q "^IMAGE_TAG_FRONTEND=" "$ENV_FILE"; then
+            sed -i '' "s|^IMAGE_TAG_FRONTEND=.*|IMAGE_TAG_FRONTEND=${{ steps.meta.outputs.image_tag }}|" "$ENV_FILE"
+          else
+            echo "IMAGE_TAG_FRONTEND=${{ steps.meta.outputs.image_tag }}" >> "$ENV_FILE"
+          fi
+          docker compose \
+            -f "$INFRA/deployment/docker-compose.yml" \
+            --env-file "$ENV_FILE" \
+            up -d --no-deps shopizer-frontend
+
+      - name: Wait for frontend health
+        run: |
+          for i in $(seq 1 12); do
+            STATUS=$(docker inspect --format='{{.State.Health.Status}}' shopizer-frontend 2>/dev/null || echo not_found)
+            [[ "$STATUS" == "healthy" ]] && echo "shopizer-frontend is healthy" && exit 0
+            printf "  [%2d/12] %s\n" "$i" "$STATUS"; sleep 5
+          done
+          echo "Health after 60s: $(docker inspect --format='{{.State.Health.Status}}' shopizer-frontend 2>/dev/null)"
+
+      - name: Clean up staged build artifacts
+        if: always()
+        run: |
+          INFRA="${INFRA_DIR:-$HOME/shopizer-infra}"
+          rm -rf "$INFRA/deployment/frontend/admin-dist" "$INFRA/deployment/frontend/react-build"
 
       - name: Write job summary
+        if: always()
         run: |
-          cat >> $GITHUB_STEP_SUMMARY <<END
-          ## ✅ Docker Image Built – shopizer-react
-
-          | Field      | Value |
-          |------------|-------|
-          | Image tag  | \`${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.image_tag }}\` |
-          | Version    | \`${{ steps.meta.outputs.version }}\` |
-          | Artifact   | \`docker-image-react-${{ steps.meta.outputs.image_tag }}\` |
-
-          **Deploy locally:**
-          \`\`\`bash
-          cd deployment
-          ./deploy-local.sh --react-tag ${{ steps.meta.outputs.image_tag }}
-          \`\`\`
+          echo "## Frontend Deployed to Colima" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | \`${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.image_tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Admin UI | http://localhost:8081 |" >> $GITHUB_STEP_SUMMARY
+          echo "| React Shop | http://localhost:8082 |" >> $GITHUB_STEP_SUMMARY
           END
